@@ -9998,8 +9998,10 @@ HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIP
     auto* d = Device::from<Device>(real ? real : device);
     if (!d) return E_INVALIDARG;
 
-    auto* heap = new DescriptorHeap(d->state(), *desc, console_address, console_size);
-    heap->attach_device(d->identity());
+    // state() returns const DeviceState& and identity() is private; holder() is the accessor the class
+    // already exposes for this hand-off.
+    auto* heap = new DescriptorHeap(const_cast<DeviceState&>(d->state()), *desc, console_address, console_size);
+    heap->attach_device(d->holder());
     if (!heap->ok()) {
         heap->Release();
         return E_OUTOFMEMORY;

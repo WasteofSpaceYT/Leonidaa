@@ -24,6 +24,22 @@
 // behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token.
 #include "d3d12_xs_device.h"
 #include "d3d12_trace.h"
+// create_console_descriptor_heap is declared in d3d12_com.h, whose Vulkan include is not on every target that
+// compiles this file. Resolve the one symbol from this module at run time and fall back to the PC method, which is
+// what a 16-byte description gets anyway.
+namespace rt::d3d12 {
+using CreateConsoleHeapFn = HRESULT(WINAPI*)(ID3D12Device*, const D3D12_DESCRIPTOR_HEAP_DESC*,
+                                            D3D12_GPU_VIRTUAL_ADDRESS, std::uint64_t, REFIID, void**);
+inline CreateConsoleHeapFn create_console_heap_fn() {
+    static const CreateConsoleHeapFn fn = [] {
+        return reinterpret_cast<CreateConsoleHeapFn>(reinterpret_cast<void*>(::GetProcAddress(
+            ::GetModuleHandleW(nullptr),
+            "?create_console_descriptor_heap@d3d12@rt@@YAJPEAUID3D12Device@@PEBUD3D12_DESCRIPTOR_HEAP_DESC@@_K2AEBU_GUID@@PEAPEAX@Z")));
+    }();
+    return fn;
+}
+}  // namespace rt::d3d12
+
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
 #include <windows.h>
@@ -1603,9 +1619,12 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
             // non-zero console VA is present; normal PC 16-byte descs never enter it.
             if (address != 0) {
                 console_extended = true;
-                hr = rt::d3d12::create_console_descriptor_heap(
-                    self->real, desc, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address), size,
-                    __uuidof(ID3D12DescriptorHeap), &created);
+                if (const auto fn = rt::d3d12::create_console_heap_fn()) {
+                    hr = fn(self->real, desc, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address), size,
+                            __uuidof(ID3D12DescriptorHeap), &created);
+                } else {
+                    hr = self->real->CreateDescriptorHeap(desc, __uuidof(ID3D12DescriptorHeap), &created);
+                }
             }
         }
     }
@@ -1856,6 +1875,23 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                                                         reinterpret_cast<const D3D12_RESOURCE_DESC*>(a2),
                                                         static_cast<std::uint32_t>(a3), reinterpret_cast<const IID*>(a5),
                                                         reinterpret_cast<void**>(a6)));
+    } else if constexpr (Slot == 26) {
+        // GetCustomHeapProperties returns D3D12_HEAP_PROPERTIES by value. The retail executable passes the hidden
+        // return buffer in RCX, which this thunk receives as `self`, and the device in RDX (`a1`); a PC member takes
+        // the device in RCX and the buffer in RDX. Forwarding that verbatim reads a vtable out of the title's buffer
+        // and faults at +0xd0. A PC-order call keeps the device in RCX, so `a1` is not a proxy and goes below.
+        // docs/retail_boot_chain.md section 3.1.
+        if (is_device_proxy(reinterpret_cast<const void*>(a1))) {
+            auto* device = reinterpret_cast<DeviceProxy*>(a1);
+            if (device->real_vtable && device->real) {
+                if (trace_enabled())
+                    std::fprintf(stderr, "[rt] d3d12_xs: device slot 26 (GetCustomHeapProperties): console order\n");
+                using StructReturnFn = void(WINAPI*)(void*, void*, std::uint64_t, std::uint64_t);
+                reinterpret_cast<StructReturnFn>(device->real_vtable[Slot])(
+                    reinterpret_cast<void*>(self), device->real, a2, a3);
+                return hr_to_u64(static_cast<std::uint64_t>(S_OK));
+            }
+        }
     } else if constexpr (Slot == 76) {
         return hr_to_u64(proxy_create_resource(
             self, reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(a1),
@@ -2047,7 +2083,7 @@ ID3D12Device* device_proxy_real_device(const void* device) {
 }
 
 bool device_slot_overridden(unsigned slot) {
-    if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 31 || slot == 32 || slot == 34 || slot == 35 ||
+    if (slot <= 2 || slot == 26 || slot == 8 || slot == 9 || slot == 14 || slot == 31 || slot == 32 || slot == 34 || slot == 35 ||
         slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
         slot == 75 || slot == 76 || slot == 133)
         return true;
